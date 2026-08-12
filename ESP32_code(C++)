@@ -1,0 +1,308 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ==========================================
+// 1. NETWORK & SERVER CONFIGURATION
+// ==========================================
+const char* WIFI_SSID     = "Wi-Fi Network 2.4+5";
+const char* WIFI_PASS     = "AlohomoraWi-FiNetwork2.4";
+const char* MAC_IP        = "192.168.0.108"; // Replace with your Mac's Local IP Address
+const int   HTTPS_PORT    = 8443;
+
+// ==========================================
+// 2. PIN DEFINITIONS & HARDWARE CONFIG
+// ==========================================
+// OLED Display (0.96" I2C: SDA=GPIO 21, SCL=GPIO 22)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// RFID RC522 SPI Pins (SCK=18, MISO=19, MOSI=23, SS=5, RST=4)
+#define SS_PIN  5
+#define RST_PIN 4
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// HW-484 Hall Effect Sensor DO Pin
+#define HALL_PIN 27
+
+// ULN2003 Stepper Driver Pins
+const int IN1 = 26; // Phase A
+const int IN2 = 32; // Phase B
+const int IN3 = 33; // Phase C
+const int IN4 = 25; // Phase D
+
+// ==========================================
+// 3. MOTOR DRIVE & SPEED TUNING (8-Step Half-Stepping)
+// ==========================================
+const int stepSequence[8][4] = {
+  {1, 0, 0, 1},
+  {1, 0, 0, 0},
+  {1, 1, 0, 0},
+  {0, 1, 0, 0},
+  {0, 1, 1, 0},
+  {0, 0, 1, 0},
+  {0, 0, 1, 1},
+  {0, 0, 0, 1}
+};
+
+const int START_DELAY  = 2800; // Starting delay in microseconds (prevents initial torque stall)
+const int TARGET_DELAY = 1000; // Top speed delay in microseconds (Lower = Faster)
+const int RAMP_STEP    = 25;   // Acceleration rate per full 8-step rotation cycle
+
+int currentDelay = START_DELAY;
+int stepIndex = 0;
+unsigned long lastStepMicros = 0;
+
+// ==========================================
+// 4. RFID THROTTLING & GLOBAL STATE
+// ==========================================
+unsigned long lastRfidCheck = 0;
+const int RFID_CHECK_INTERVAL = 250; // Check RFID reader every 250ms (removes SPI delay during motor movement)
+
+bool spinning = false;
+String current_rfid = "";
+String currentSong = "Scan Record...";
+
+WiFiClientSecure client;
+
+// ==========================================
+// 5. HELPER FUNCTIONS
+// ==========================================
+
+// Plays procedural spinning vinyl record animation on OLED startup
+void playStartupAnimation() {
+  const int centerX = 64;
+  const int centerY = 28;
+  const int recordRadius = 24;
+
+  for (int frame = 0; frame < 30; frame++) {
+    display.clearDisplay();
+
+    // Concentric Groove Circles
+    display.drawCircle(centerX, centerY, recordRadius, SSD1306_WHITE);      // Outer Rim
+    display.drawCircle(centerX, centerY, recordRadius - 4, SSD1306_WHITE);  // Outer Groove
+    display.drawCircle(centerX, centerY, recordRadius - 8, SSD1306_WHITE);  // Mid Groove
+    display.drawCircle(centerX, centerY, recordRadius - 12, SSD1306_WHITE); // Inner Groove
+
+    // Rotating Reflection Glare Line
+    float angle = frame * 0.25;
+    int x1 = centerX + cos(angle) * (recordRadius - 1);
+    int y1 = centerY + sin(angle) * (recordRadius - 1);
+    int x2 = centerX - cos(angle) * (recordRadius - 1);
+    int y2 = centerY - sin(angle) * (recordRadius - 1);
+    display.drawLine(centerX, centerY, x1, y1, SSD1306_WHITE);
+    display.drawLine(centerX, centerY, x2, y2, SSD1306_WHITE);
+
+    // Center Record Label
+    display.fillCircle(centerX, centerY, 7, SSD1306_WHITE);
+    display.fillCircle(centerX, centerY, 2, SSD1306_BLACK); // Spindle Hole
+
+    // Title Banner
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(20, 56);
+    display.print("TURNTABLE v1.0");
+
+    display.display();
+    delay(100);
+  }
+}
+
+// Updates OLED screen with text-wrapping support for long titles
+void displayMessage(String line1, String line2 = "") {
+  display.clearDisplay();
+  display.setTextWrap(true);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println("NOW PLAYING:");
+  display.println("---------------------");
+  
+  display.setCursor(0, 18);
+  display.println(line1);
+  
+  if (line2.length() > 0) {
+    display.setCursor(0, 52);
+    display.println(line2);
+  }
+  display.display();
+}
+
+// Cuts coil power to prevent driver heating when motor is stopped
+void stopMotorCoils() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Non-blocking smooth step execution with acceleration ramping
+void stepMotorFast() {
+  digitalWrite(IN1, stepSequence[stepIndex][0]);
+  digitalWrite(IN2, stepSequence[stepIndex][1]);
+  digitalWrite(IN3, stepSequence[stepIndex][2]);
+  digitalWrite(IN4, stepSequence[stepIndex][3]);
+
+  stepIndex = (stepIndex + 1) % 8;
+
+  // Accelerate after completing every full 8-step rotation cycle
+  if (stepIndex == 0 && currentDelay > TARGET_DELAY) {
+    currentDelay -= RAMP_STEP;
+    if (currentDelay < TARGET_DELAY) {
+      currentDelay = TARGET_DELAY;
+    }
+  }
+}
+
+// Sends HTTPS GET request to Mac server
+String sendHttpsGet(String path) {
+  client.setInsecure(); // Skip SSL certificate validation for self-signed local server
+  
+  if (!client.connect(MAC_IP, HTTPS_PORT)) {
+    Serial.println("Connection to Mac Server Failed!");
+    return "Error: Conn Failed";
+  }
+
+  client.print(String("GET ") + path + " HTTP/1.1\r\n" +
+               "Host: " + MAC_IP + "\r\n" +
+               "User-Agent: ESP32Turntable\r\n" +
+               "Connection: close\r\n\r\n");
+
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 3000) {
+      client.stop();
+      return "Error: Timeout";
+    }
+  }
+
+  String responseBody = "";
+  bool isBody = false;
+
+  while (client.available()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") {
+      isBody = true;
+      continue;
+    }
+    if (isBody) {
+      responseBody += line;
+    }
+  }
+  client.stop();
+  responseBody.trim();
+  return responseBody;
+}
+
+// ==========================================
+// 6. SETUP ROUTINE
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // Stepper Motor Pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotorCoils();
+
+  // Hall Sensor Pin
+  pinMode(HALL_PIN, INPUT_PULLUP);
+
+  // Initialize OLED (I2C SDA=GPIO 21, SCL=GPIO 22)
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+
+  // Startup Animation
+  playStartupAnimation();
+
+  displayMessage("Connecting WiFi...");
+
+  // Connect to Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected. IP: " + WiFi.localIP().toString());
+
+  // Initialize SPI & RFID Reader
+  SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
+  rfid.PCD_Init();
+
+  displayMessage("Ready!", "Place Tonearm Down");
+}
+
+// ==========================================
+// 7. MAIN LOGIC LOOP
+// ==========================================
+void loop() {
+  // Read Tonearm State (LOW = Magnet Detected / Tonearm Down)
+  bool magnetDetected = (digitalRead(HALL_PIN) == LOW);
+
+  // --- A. TONEARM LOWERED (Start Motor & Resume Playback) ---
+  if (magnetDetected && !spinning) {
+    Serial.println("Magnet detected -> starting motor & playback");
+    spinning = true;
+
+    currentSong = sendHttpsGet("/play");
+    displayMessage(currentSong, "[PLAYING]");
+  }
+  // --- B. TONEARM LIFTED (Stop Motor & Pause Playback) ---
+  else if (!magnetDetected && spinning) {
+    Serial.println("Magnet lost -> stopping motor & pausing playback");
+    spinning = false;
+    current_rfid = "";          // Clear active tag so lifting/lowering restarts playback
+    currentDelay = START_DELAY;  // Reset acceleration ramp
+    stopMotorCoils();
+
+    sendHttpsGet("/pause");
+    displayMessage(currentSong, "[PAUSED]");
+  }
+
+  // --- C. ACTIVE PLAYBACK STATE ---
+  if (spinning) {
+    // 1. High-Priority Motor Execution (Runs microsecond step timing smoothly)
+    if (micros() - lastStepMicros >= currentDelay) {
+      lastStepMicros = micros();
+      stepMotorFast();
+    }
+
+    // 2. Throttled Non-Blocking RFID Scan (Runs every 250ms to maintain motor speed)
+    if (millis() - lastRfidCheck >= RFID_CHECK_INTERVAL) {
+      lastRfidCheck = millis();
+
+      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        String scannedUid = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+          if (rfid.uid.uidByte[i] < 0x10) scannedUid += "0";
+          scannedUid += String(rfid.uid.uidByte[i], HEX);
+        }
+        scannedUid.toUpperCase();
+
+        // Send GET request when a new/different tag is scanned
+        if (scannedUid != current_rfid) {
+          Serial.println("RFID changed: " + scannedUid);
+          current_rfid = scannedUid;
+
+          displayMessage("Scanning...", scannedUid);
+          currentSong = sendHttpsGet("/scan?uid=" + scannedUid);
+          displayMessage(currentSong, "[PLAYING]");
+        }
+
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
+      }
+    }
+  }
+}
