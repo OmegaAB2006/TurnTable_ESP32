@@ -1,0 +1,247 @@
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
+import java.util.HashMap;
+import java.util.Map;
+import javax.net.ssl.*;
+
+public class TurntableServer {
+
+    private static final int PORT = 8443;
+    private static final String KEYSTORE_PATH = "keystore.p12";
+    private static final String KEYSTORE_PASS = "password";
+    private static final String JSON_FILE_PATH = "rfid.json";
+
+    public static void main(String[] args) throws Exception {
+        SSLContext sslContext = createSSLContext();
+        HttpsServer server = HttpsServer.create(new InetSocketAddress(PORT), 0);
+        server.setHttpsConfigurator(new HttpsConfigurator(sslContext));
+
+        server.createContext("/scan", new ScanHandler());
+        server.createContext("/play", new PlayHandler());
+        server.createContext("/pause", new PauseHandler());
+        server.createContext("/current", new CurrentTrackHandler());
+
+        server.setExecutor(null);
+        System.out.println("Turntable HTTPS Server listening on port " + PORT);
+        System.out.println("Reading mappings dynamically from: " + JSON_FILE_PATH);
+        server.start();
+    }
+
+    private static SSLContext createSSLContext() throws Exception {
+        char[] password = KEYSTORE_PASS.toCharArray();
+        KeyStore ks = KeyStore.getInstance("PKCS12");
+        try (InputStream fis = new FileInputStream(KEYSTORE_PATH)) {
+            ks.load(fis, password);
+        }
+
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, password);
+
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), null, null);
+        return sslContext;
+    }
+
+    private static Map<String, String> loadRfidMap() {
+        Map<String, String> map = new HashMap<>();
+        File file = new File(JSON_FILE_PATH);
+
+        if (!file.exists()) {
+            System.err.println("Warning: " + JSON_FILE_PATH + " not found. Please create it in the server directory.");
+            return map;
+        }
+
+        try (BufferedReader br = new BufferedReader(new FileReader(file, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) {
+                sb.append(line);
+            }
+            String content = sb.toString().trim();
+
+            if (content.startsWith("{") && content.endsWith("}")) {
+                content = content.substring(1, content.length() - 1);
+                String[] pairs = content.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
+                for (String pair : pairs) {
+                    String[] keyValue = pair.split(":(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
+                    if (keyValue.length == 2) {
+                        String key = keyValue[0].replaceAll("[\"\\s]", "").toUpperCase();
+                        String value = keyValue[1].trim();
+                        if (value.startsWith("\"") && value.endsWith("\"")) {
+                            value = value.substring(1, value.length() - 1);
+                        }
+                        map.put(key, value);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error reading " + JSON_FILE_PATH + ": " + e.getMessage());
+        }
+        return map;
+    }
+
+    private static String sanitizeForAppleScript(String input) {
+        if (input == null) return "";
+        return input.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    // Pipes multi-line AppleScript directly into osascript stdin to avoid execution errors
+    private static String executeAppleScript(String script) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("osascript");
+            Process process = pb.start();
+
+            try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))) {
+                writer.write(script);
+                writer.flush();
+            }
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line);
+            }
+
+            BufferedReader errReader = new BufferedReader(new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8));
+            StringBuilder errOutput = new StringBuilder();
+            while ((line = errReader.readLine()) != null) {
+                errOutput.append(line);
+            }
+
+            process.waitFor();
+
+            if (errOutput.length() > 0) {
+                System.err.println("AppleScript Exec Error: " + errOutput.toString());
+            }
+
+            return output.toString().trim();
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "Error";
+        }
+    }
+
+    private static String getCurrentTrackName() {
+        String script = "tell application \"Music\" to get name of current track";
+        String track = executeAppleScript(script);
+        return track.isEmpty() ? "Unknown Track" : track;
+    }
+    private static void playMedia(String mediaName) {
+    String song;
+    String script;
+
+    if (mediaName.startsWith("track:")) {
+        song = sanitizeForAppleScript(mediaName.substring(6).trim());
+        System.out.println("Playing Single Track: \"" + song + "\"");
+        script = "tell application \"Music\"\n" +
+                 "    activate\n" +
+                 "    try\n" +
+                 "        play (first track of library playlist 1 whose name contains \"" + song + "\")\n" +
+                 "    on error errMsg\n" +
+                 "        return \"PLAY_ERROR: \" & errMsg\n" +
+                 "    end try\n" +
+                 "end tell";
+    } else if (mediaName.startsWith("playlist:")) {
+        song = sanitizeForAppleScript(mediaName.substring(9).trim());
+        System.out.println("Playing Playlist: \"" + song + "\"");
+        script = "tell application \"Music\"\n" +
+                 "    activate\n" +
+                 "    try\n" +
+                 "        play (first playlist whose name contains \"" + song + "\")\n" +
+                 "    on error errMsg\n" +
+                 "        return \"PLAY_ERROR: \" & errMsg\n" +
+                 "    end try\n" +
+                 "end tell";
+    } else {
+        song = sanitizeForAppleScript(mediaName.trim());
+        System.out.println("Auto-detecting media: \"" + song + "\"");
+        script = "tell application \"Music\"\n" +
+                 "    activate\n" +
+                 "    try\n" +
+                 "        play (first playlist whose name contains \"" + song + "\")\n" +
+                 "    on error\n" +
+                 "        try\n" +
+                 "            play (first track of library playlist 1 whose name contains \"" + song + "\")\n" +
+                 "        on error errMsg\n" +
+                 "            return \"PLAY_ERROR: \" & errMsg\n" +
+                 "        end try\n" +
+                 "    end try\n" +
+                 "end tell";
+    }
+
+    String result = executeAppleScript(script);
+    if (result.startsWith("PLAY_ERROR")) {
+        System.err.println("Music playback failed for \"" + song + "\": " + result);
+    }
+}
+
+
+    
+    static class ScanHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String query = exchange.getRequestURI().getQuery();
+            String uid = "";
+            if (query != null && query.contains("uid=")) {
+                uid = query.split("uid=")[1].split("&")[0];
+                uid = URLDecoder.decode(uid, StandardCharsets.UTF_8).toUpperCase().trim();
+            }
+
+            Map<String, String> rfidMap = loadRfidMap();
+            String media = rfidMap.getOrDefault(uid, null);
+            String responseText;
+
+            if (media != null) {
+                System.out.println("RFID Matched: " + uid + " -> Target: \"" + media + "\"");
+                playMedia(media);
+                try { Thread.sleep(600); } catch (InterruptedException ignored) {}
+                responseText = getCurrentTrackName();
+            } else {
+                System.out.println("Unrecognized RFID UID: " + uid);
+                responseText = "Unknown Tag: " + uid;
+            }
+
+            sendResponse(exchange, responseText);
+        }
+    }
+
+    static class PlayHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            System.out.println("Tonearm Placed: Resuming Playback");
+            executeAppleScript("tell application \"Music\" to play");
+            String track = getCurrentTrackName();
+            sendResponse(exchange, track);
+        }
+    }
+
+    static class PauseHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            System.out.println("Tonearm Lifted: Pausing Playback");
+            executeAppleScript("tell application \"Music\" to pause");
+            sendResponse(exchange, "PAUSED");
+        }
+    }
+
+    static class CurrentTrackHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String track = getCurrentTrackName();
+            sendResponse(exchange, track);
+        }
+    }
+
+    private static void sendResponse(HttpExchange exchange, String response) throws IOException {
+        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+}
